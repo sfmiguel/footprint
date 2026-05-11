@@ -3,17 +3,22 @@
 # ArcGIS Pro Python Toolbox
 # Tools:
 #   1. Raster Footprint (Single Image)
+#   2. Raster Footprint (Batch - Image Folder)
 
 import os
 import math
 import arcpy
+
+# Supported raster extensions (batch tool image discovery)
+RASTER_EXTENSIONS = {".tif", ".tiff", ".img", ".jp2", ".jpg",
+                     ".jpeg", ".png", ".ecw", ".sid", ".vrt"}
 
 
 class Toolbox:
     def __init__(self):
         self.label = "Raster Footprint Tools"
         self.alias = "RasterFootprint"
-        self.tools = [RasterFootprintSingle]
+        self.tools = [RasterFootprintSingle, RasterFootprintBatch]
 
 
 # ---------------------------------------------------------------------------
@@ -411,3 +416,295 @@ class RasterFootprintSingle:
         except Exception:
             pass
         return None
+
+
+# ---------------------------------------------------------------------------
+# Tool: Raster Footprint - Batch (Image Folder)
+# ---------------------------------------------------------------------------
+
+class RasterFootprintBatch:
+
+    def __init__(self):
+        self.label = "Raster Footprint (Batch - Image Folder)"
+        self.description = (
+            "Creates polygon footprints for all raster images found in an input "
+            "folder. Results are stored in a File GDB feature class with ID and "
+            "NamIMG attributes. Supports the same NoData handling and gap-closing "
+            "options as the single-image tool."
+        )
+        self.canRunInBackground = False
+
+    # -- Parameters -----------------------------------------------------------
+
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(
+            displayName   = "Input Image Folder",
+            name          = "image_folder",
+            datatype      = "DEFolder",
+            parameterType = "Required",
+            direction     = "Input"
+        )
+
+        p1 = arcpy.Parameter(
+            displayName   = "Output File GDB",
+            name          = "out_gdb",
+            datatype      = "DEWorkspace",
+            parameterType = "Required",
+            direction     = "Output"
+        )
+        p1.filter.list = ["Local Database"]
+
+        p2 = arcpy.Parameter(
+            displayName   = "Output Feature Class Name",
+            name          = "out_fc_name",
+            datatype      = "GPString",
+            parameterType = "Required",
+            direction     = "Input"
+        )
+        p2.value = "Footprints"
+
+        p3 = arcpy.Parameter(
+            displayName   = "NoData Value (if not defined in rasters)",
+            name          = "nodata_value",
+            datatype      = "GPDouble",
+            parameterType = "Optional",
+            direction     = "Input"
+        )
+        p3.value = None
+
+        p4 = arcpy.Parameter(
+            displayName   = "Close Interior Holes and Edge Gaps",
+            name          = "close_gaps",
+            datatype      = "GPBoolean",
+            parameterType = "Optional",
+            direction     = "Input"
+        )
+        p4.value = False
+
+        p5 = arcpy.Parameter(
+            displayName   = "Minimum Gap Width to Close (map units)",
+            name          = "min_gap_width",
+            datatype      = "GPDouble",
+            parameterType = "Optional",
+            direction     = "Input"
+        )
+        p5.value   = None
+        p5.enabled = False
+
+        return [p0, p1, p2, p3, p4, p5]
+
+    # -- Dynamic UI -----------------------------------------------------------
+
+    def updateParameters(self, parameters):
+        parameters[5].enabled = bool(parameters[4].value)
+
+    def isLicensed(self):
+        return arcpy.CheckExtension("3D") == "Available"
+
+    def updateMessages(self, parameters):
+        if parameters[0].value:
+            folder = str(parameters[0].value)
+            if os.path.isdir(folder):
+                images = [
+                    f for f in os.listdir(folder)
+                    if os.path.splitext(f)[1].lower() in RASTER_EXTENSIONS
+                ]
+                if not images:
+                    parameters[0].setWarningMessage(
+                        "No supported raster files found in this folder. "
+                        "Supported formats: "
+                        + ", ".join(sorted(RASTER_EXTENSIONS))
+                    )
+                else:
+                    parameters[0].clearMessage()
+        if parameters[4].value and not parameters[5].value:
+            parameters[5].setWarningMessage(
+                "Please specify the minimum gap width to close."
+            )
+
+    # -- Execute --------------------------------------------------------------
+
+    def execute(self, parameters, messages):
+        image_folder  = parameters[0].valueAsText
+        out_gdb       = parameters[1].valueAsText
+        out_fc_name   = parameters[2].valueAsText
+        user_nodata   = parameters[3].value
+        close_gaps    = bool(parameters[4].value)
+        min_gap_width = parameters[5].value
+
+        if close_gaps and min_gap_width is None:
+            arcpy.AddError(
+                "[ERROR] 'Minimum Gap Width' is required when 'Close Gaps' is enabled."
+            )
+            return
+
+        if min_gap_width is not None:
+            min_gap_width = float(min_gap_width)
+
+        arcpy.env.overwriteOutput = True
+
+        # ── Discover and validate images ──────────────────────────────────────
+        image_files = sorted([
+            f for f in os.listdir(image_folder)
+            if os.path.splitext(f)[1].lower() in RASTER_EXTENSIONS
+        ])
+
+        if not image_files:
+            arcpy.AddError(
+                f"[ERROR] No supported raster files found in: {image_folder}"
+            )
+            return
+
+        arcpy.AddMessage(f"[INFO] Found {len(image_files)} image(s) to process.")
+        for f in image_files:
+            arcpy.AddMessage(f"         {f}")
+
+        # ── Create GDB if needed ──────────────────────────────────────────────
+        gdb_dir  = os.path.dirname(out_gdb)
+        gdb_name = os.path.basename(out_gdb)
+        if not arcpy.Exists(out_gdb):
+            arcpy.management.CreateFileGDB(gdb_dir, gdb_name)
+            arcpy.AddMessage(f"[INFO] Created GDB: {out_gdb}")
+        else:
+            arcpy.AddMessage(f"[INFO] GDB already exists: {out_gdb}")
+
+        arcpy.env.workspace        = out_gdb
+        arcpy.env.scratchWorkspace = out_gdb
+
+        # ── Process each image ────────────────────────────────────────────────
+        arcpy.CheckOutExtension("3D")
+        output_fc = None
+        seq_id    = 1
+        processed = 0
+
+        for idx, img_file in enumerate(image_files, start=1):
+            raster_path = os.path.join(image_folder, img_file)
+            arcpy.AddMessage(f"\n[{idx}/{len(image_files)}] {img_file}")
+
+            # ── NoData ────────────────────────────────────────────────────────
+            existing_nodata = RasterFootprintSingle._get_nodata(raster_path)
+            temp_raster = None
+
+            if existing_nodata is not None:
+                raster_to_process = raster_path
+            elif user_nodata is not None:
+                temp_raster = f"in_memory\\temp_{idx}"
+                arcpy.management.CopyRaster(
+                    in_raster         = raster_path,
+                    out_rasterdataset = temp_raster,
+                    nodata_value      = str(user_nodata)
+                )
+                raster_to_process = temp_raster
+            else:
+                arcpy.AddWarning(
+                    f"  [WARN] No NoData defined — footprint covers full extent."
+                )
+                raster_to_process = raster_path
+
+            # ── Raster Domain ─────────────────────────────────────────────────
+            safe_name  = arcpy.ValidateTableName(
+                os.path.splitext(img_file)[0], out_gdb
+            )
+            tmp_domain = f"tmp_dom_{safe_name}"
+
+            try:
+                arcpy.ddd.RasterDomain(
+                    in_raster         = raster_to_process,
+                    out_feature_class = tmp_domain,
+                    out_geometry_type = "POLYGON"
+                )
+            except Exception as e:
+                arcpy.AddWarning(f"  [WARN] RasterDomain failed: {e}")
+                if temp_raster and arcpy.Exists(temp_raster):
+                    arcpy.management.Delete(temp_raster)
+                continue
+
+            if temp_raster and arcpy.Exists(temp_raster):
+                arcpy.management.Delete(temp_raster)
+
+            # ── Eliminate holes + close gaps (optional) ───────────────────────
+            if close_gaps:
+                tmp_no_holes = f"tmp_nh_{safe_name}"
+                arcpy.management.EliminatePolygonPart(
+                    in_features       = tmp_domain,
+                    out_feature_class = tmp_no_holes,
+                    condition         = "PERCENT",
+                    part_area         = 0,
+                    part_area_percent = 99,
+                    part_option       = "CONTAINED_ONLY"
+                )
+                arcpy.management.Delete(tmp_domain)
+
+                try:
+                    cell_size = float(
+                        arcpy.Describe(raster_path).children[0].meanCellWidth
+                    )
+                except Exception:
+                    try:
+                        cell_size = float(arcpy.Raster(raster_path).meanCellWidth)
+                    except Exception:
+                        cell_size = 30.0
+
+                with arcpy.da.UpdateCursor(tmp_no_holes, ["SHAPE@"]) as cur:
+                    for row in cur:
+                        if row[0] is None:
+                            continue
+                        try:
+                            cur.updateRow([
+                                close_boundary_gaps(
+                                    row[0], min_gap_width, cell_size
+                                )
+                            ])
+                        except Exception as e:
+                            arcpy.AddWarning(f"  [WARN] Gap closing failed: {e}")
+
+                source_fc = tmp_no_holes
+            else:
+                source_fc = tmp_domain
+
+            # ── Create output FC on first successful result ───────────────────
+            if output_fc is None:
+                sr      = arcpy.Describe(raster_path).spatialReference
+                fc_path = os.path.join(out_gdb, out_fc_name)
+                if arcpy.Exists(fc_path):
+                    arcpy.management.Delete(fc_path)
+                arcpy.management.CreateFeatureclass(
+                    out_path          = out_gdb,
+                    out_name          = out_fc_name,
+                    geometry_type     = "POLYGON",
+                    spatial_reference = sr
+                )
+                arcpy.management.AddField(
+                    fc_path, "ID", "LONG", field_alias="ID"
+                )
+                arcpy.management.AddField(
+                    fc_path, "NamIMG", "TEXT",
+                    field_length=255, field_alias="Image Name"
+                )
+                arcpy.AddMessage(
+                    f"[INFO] Output feature class created: {fc_path}"
+                )
+                output_fc = fc_path
+
+            # ── Append footprint(s) to output FC ──────────────────────────────
+            n = 0
+            with arcpy.da.SearchCursor(source_fc, ["SHAPE@"]) as src, \
+                 arcpy.da.InsertCursor(
+                     output_fc, ["SHAPE@", "ID", "NamIMG"]
+                 ) as ins:
+                for row in src:
+                    ins.insertRow((row[0], seq_id, img_file))
+                    seq_id += 1
+                    n      += 1
+
+            arcpy.management.Delete(source_fc)
+            processed += 1
+            arcpy.AddMessage(f"  → {n} footprint polygon(s) added.")
+
+        arcpy.CheckInExtension("3D")
+
+        if processed == 0:
+            arcpy.AddWarning("[WARN] No footprints were created. Check errors above.")
+        else:
+            arcpy.AddMessage(f"\n[DONE] {processed}/{len(image_files)} image(s) processed.")
+            arcpy.AddMessage(f"       Output: {os.path.join(out_gdb, out_fc_name)}")
