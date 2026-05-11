@@ -267,6 +267,15 @@ class RasterFootprintSingle:
         close_gaps    = bool(parameters[3].value)
         max_gap_width = parameters[4].value
 
+        # ── Log received parameters ────────────────────────────────────────
+        arcpy.AddMessage("=== Parameters received ===")
+        arcpy.AddMessage(f"  Image path    : {image_path}")
+        arcpy.AddMessage(f"  Output shp    : {output_shp}")
+        arcpy.AddMessage(f"  User NoData   : {user_nodata}")
+        arcpy.AddMessage(f"  Close gaps    : {close_gaps}")
+        arcpy.AddMessage(f"  Max gap width : {max_gap_width}")
+        arcpy.AddMessage("===========================")
+
         arcpy.env.overwriteOutput = True
 
         # ── Check / set NoData ─────────────────────────────────────────────
@@ -363,8 +372,14 @@ class RasterFootprintSingle:
                 geom = row[0]
                 if geom is None:
                     continue
-                new_geom = close_boundary_gaps(geom, float(max_gap_width))
-                cursor.updateRow([new_geom])
+                arcpy.AddMessage(f"[INFO] Processing polygon with {geom.pointCount} points across {geom.partCount} part(s)...")
+                try:
+                    new_geom = close_boundary_gaps(geom, float(max_gap_width))
+                    cursor.updateRow([new_geom])
+                except Exception as e:
+                    arcpy.AddWarning(f"[WARN] Gap closing failed for a polygon: {e}")
+                    import traceback
+                    arcpy.AddWarning(traceback.format_exc())
 
         arcpy.AddMessage(f"[INFO] Footprint created: {output_shp}")
         arcpy.AddMessage("[DONE] Process complete.")
