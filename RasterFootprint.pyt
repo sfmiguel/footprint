@@ -5,6 +5,7 @@
 #   1. Raster Footprint (Single Image)
 
 import os
+import math
 import arcpy
 
 
@@ -16,40 +17,135 @@ class Toolbox:
 
 
 # ---------------------------------------------------------------------------
-# Geometry helper: close boundary gaps using morphological closing
+# Geometry helpers for vertex-chain gap closing
 # ---------------------------------------------------------------------------
+
+def _signed_area(pts):
+    """Shoelace formula. Positive = CCW winding."""
+    n = len(pts)
+    return sum(
+        pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+        for i in range(n)
+    ) / 2.0
+
+
+def _is_reflex(pts, i, ccw):
+    """
+    True if vertex i is a reflex vertex (interior angle > 180 degrees).
+    For a CCW polygon a right-hand turn (negative cross product) is reflex.
+    """
+    n    = len(pts)
+    prev = pts[(i - 1) % n]
+    curr = pts[i]
+    nxt  = pts[(i + 1) % n]
+    cross = (curr[0] - prev[0]) * (nxt[1] - curr[1]) \
+          - (curr[1] - prev[1]) * (nxt[0] - curr[0])
+    return cross < 0 if ccw else cross > 0
+
 
 def close_boundary_gaps(polygon_geom, max_gap_width):
     """
-    Returns a new arcpy.Polygon where edge gaps (concave bays) narrower than
-    max_gap_width are closed using morphological closing:
-      1. Buffer polygon outward by max_gap_width / 2  -> fills narrow bays
-      2. Buffer the result inward by max_gap_width / 2 -> restores outer boundary
+    Returns a new arcpy.Polygon where concave edge indentations whose chord
+    (straight-line distance between the two boundary points flanking the
+    indentation) is <= max_gap_width are replaced by that straight chord.
 
-    This approach works correctly for raster (pixelated/staircase) polygon
-    boundaries where concave and convex vertices alternate and vertex-chain
-    methods cannot detect the actual gaps.
+    The polygon must already have been simplified to remove pixel-grid
+    staircase artifacts before calling this (see Step 2b in execute).
 
-    Interior holes must already have been eliminated before calling this.
+    Algorithm
+    ---------
+    1. Extract outer ring vertices.
+    2. Remove the duplicate closing vertex if present.
+    3. Rotate the list so index 0 is a non-reflex vertex.
+    4. Find maximal consecutive chains of reflex vertices.
+    5. For each chain whose chord <= max_gap_width, remove those vertices
+       (the two flanking vertices are then connected directly).
+    6. Rebuild the polygon from the remaining vertices.
     """
-    radius = max_gap_width / 2.0
-    arcpy.AddMessage(
-        f"[DEBUG] Morphological closing: gap width = {max_gap_width:.4f}, "
-        f"buffer radius = {radius:.4f}"
-    )
-    arcpy.AddMessage(f"[DEBUG] Original polygon area  : {polygon_geom.area:.4f}")
+    sr   = polygon_geom.spatialReference
+    part = polygon_geom.getPart(0)
 
-    closed = polygon_geom.buffer(radius).buffer(-radius)
+    # Extract only the outer ring - stop at first None (ring separator)
+    pts = []
+    for i in range(part.count):
+        pnt = part.getObject(i)
+        if pnt is None:
+            break
+        pts.append((pnt.X, pnt.Y))
 
-    if closed is None or closed.area == 0:
-        arcpy.AddWarning(
-            "[WARN] Morphological closing produced an empty result - "
-            "returning original polygon."
-        )
+    # Remove duplicate closing vertex if present
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+
+    n = len(pts)
+    if n < 3:
         return polygon_geom
 
-    arcpy.AddMessage(f"[DEBUG] Closed polygon area     : {closed.area:.4f}")
-    return closed
+    area = _signed_area(pts)
+    ccw  = area > 0
+
+    reflex   = [_is_reflex(pts, i, ccw) for i in range(n)]
+    n_reflex = sum(reflex)
+    arcpy.AddMessage(f"[DEBUG] Vertices: {n}, reflex: {n_reflex}, winding: {'CCW' if ccw else 'CW'}")
+
+    if n_reflex == 0:
+        return polygon_geom
+
+    # Rotate so index 0 is non-reflex (avoids wrap-around chains)
+    first_convex = next((i for i in range(n) if not reflex[i]), None)
+    if first_convex is None:
+        return polygon_geom
+    if first_convex != 0:
+        pts    = pts[first_convex:]    + pts[:first_convex]
+        reflex = reflex[first_convex:] + reflex[:first_convex]
+
+    # Find consecutive chains of reflex vertices and close those within threshold
+    skip           = set()
+    chains_found   = 0
+    chains_closed  = 0
+    i = 0
+    while i < n:
+        if not reflex[i]:
+            i += 1
+            continue
+
+        chain_start = i
+        chain_end   = i
+        while chain_end + 1 < n and reflex[chain_end + 1]:
+            chain_end += 1
+
+        ax, ay = pts[chain_start - 1]
+        bx, by = pts[(chain_end + 1) % n]
+        chord  = math.hypot(bx - ax, by - ay)
+        chains_found += 1
+
+        status = "CLOSE" if chord <= max_gap_width else "SKIP"
+        arcpy.AddMessage(
+            f"[DEBUG] Chain [{chain_start}:{chain_end}] "
+            f"({chain_end - chain_start + 1} vertices), chord={chord:.2f} ({status})"
+        )
+
+        if chord <= max_gap_width:
+            for k in range(chain_start, chain_end + 1):
+                skip.add(k)
+            chains_closed += 1
+
+        i = chain_end + 1
+
+    arcpy.AddMessage(
+        f"[DEBUG] Chains found: {chains_found}, closed: {chains_closed}, "
+        f"vertices removed: {len(skip)}"
+    )
+
+    new_pts = [arcpy.Point(x, y)
+               for idx, (x, y) in enumerate(pts)
+               if idx not in skip]
+
+    if len(new_pts) < 3:
+        return polygon_geom
+
+    new_pts.append(new_pts[0])   # close the ring
+    return arcpy.Polygon(arcpy.Array(new_pts), sr)
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +160,14 @@ class RasterFootprintSingle:
             "Creates a polygon footprint for a single raster image using the "
             "ArcGIS 3D Analyst 'Raster Domain' tool. NoData pixels are excluded "
             "from the footprint. Interior NoData holes and edge indentations can "
-            "optionally be closed using morphological closing."
+            "optionally be closed by connecting their boundary endpoints with "
+            "straight lines."
         )
         self.canRunInBackground = False
 
     # -- Parameters -----------------------------------------------------------
 
     def getParameterInfo(self):
-        # Parameter 0 - Input raster
         p0 = arcpy.Parameter(
             displayName   = "Input Raster",
             name          = "in_raster",
@@ -80,7 +176,6 @@ class RasterFootprintSingle:
             direction     = "Input"
         )
 
-        # Parameter 1 - Output shapefile
         p1 = arcpy.Parameter(
             displayName   = "Output Footprint Shapefile",
             name          = "out_shp",
@@ -89,7 +184,6 @@ class RasterFootprintSingle:
             direction     = "Output"
         )
 
-        # Parameter 2 - NoData value (optional)
         p2 = arcpy.Parameter(
             displayName   = "NoData Value (if not defined in raster)",
             name          = "nodata_value",
@@ -99,7 +193,6 @@ class RasterFootprintSingle:
         )
         p2.value = None
 
-        # Parameter 3 - Close gaps toggle
         p3 = arcpy.Parameter(
             displayName   = "Close Interior Holes and Edge Gaps",
             name          = "close_gaps",
@@ -109,7 +202,6 @@ class RasterFootprintSingle:
         )
         p3.value = False
 
-        # Parameter 4 - Maximum gap width (active only when close_gaps = True)
         p4 = arcpy.Parameter(
             displayName   = "Maximum Gap Width to Close (map units)",
             name          = "max_gap_width",
@@ -155,7 +247,6 @@ class RasterFootprintSingle:
         close_gaps    = bool(parameters[3].value)
         max_gap_width = parameters[4].value
 
-        # -- Log received parameters ------------------------------------------
         arcpy.AddMessage("=== Parameters received ===")
         arcpy.AddMessage(f"  Image path    : {image_path}")
         arcpy.AddMessage(f"  Output shp    : {output_shp}")
@@ -233,7 +324,7 @@ class RasterFootprintSingle:
             arcpy.AddMessage("[DONE] Process complete.")
             return
 
-        # -- Step 2: Eliminate interior holes ---------------------------------
+        # -- Step 2a: Eliminate interior holes --------------------------------
         arcpy.AddMessage("[INFO] Eliminating interior holes...")
         tmp_no_holes = r"in_memory\tmp_no_holes"
 
@@ -247,18 +338,50 @@ class RasterFootprintSingle:
         )
         arcpy.management.Delete(tmp_domain)
 
-        # -- Step 3: Close edge gaps using morphological closing --------------
-        # Buffer polygon outward by max_gap_width/2 (fills narrow concave bays)
-        # then buffer inward by max_gap_width/2 (restores outer boundary).
-        # This closes any concave bay whose width is <= max_gap_width,
-        # regardless of whether the boundary is smooth or raster-staircase.
+        # -- Step 2b: Simplify to remove pixel-grid staircase artifacts -------
+        # The raster footprint has a staircase boundary where convex and reflex
+        # vertices alternate every pixel. This prevents the chain algorithm from
+        # detecting real concave gaps (whose lips also have staircase rims).
+        # Generalizing with a tolerance equal to the pixel cell size collapses
+        # those single-pixel steps into clean diagonal lines. The actual concave
+        # bays (which span many pixels) survive and become proper consecutive
+        # reflex-vertex chains that the algorithm can detect and close.
+        try:
+            cell_size = float(arcpy.Describe(image_path).children[0].meanCellWidth)
+        except Exception:
+            try:
+                cell_size = float(arcpy.Raster(image_path).meanCellWidth)
+            except Exception:
+                cell_size = 0.0
+
+        tmp_simplified = r"in_memory\tmp_simplified"
+        if cell_size > 0:
+            arcpy.AddMessage(
+                f"[INFO] Simplifying polygon with tolerance = {cell_size:.4f} "
+                "(= 1 pixel) to remove staircase artifacts before gap detection..."
+            )
+            arcpy.management.CopyFeatures(tmp_no_holes, tmp_simplified)
+            # Generalize in-place: removes vertices within tolerance of the line
+            # between their neighbours. Does not require Cartography extension.
+            arcpy.edit.Generalize(tmp_simplified, f"{cell_size} Unknown")
+        else:
+            arcpy.AddWarning(
+                "[WARN] Could not determine pixel cell size; "
+                "skipping staircase simplification. "
+                "Gap detection may miss raster-edge bays."
+            )
+            arcpy.management.CopyFeatures(tmp_no_holes, tmp_simplified)
+
+        arcpy.management.Delete(tmp_no_holes)
+
+        # -- Step 3: Close edge gaps with vertex-chain straight-line closing --
         arcpy.AddMessage(
             f"[INFO] Closing edge gaps narrower than {max_gap_width} map units "
-            "using morphological closing (buffer out + buffer in)..."
+            "by connecting boundary endpoints with straight lines..."
         )
 
-        arcpy.management.CopyFeatures(tmp_no_holes, output_shp)
-        arcpy.management.Delete(tmp_no_holes)
+        arcpy.management.CopyFeatures(tmp_simplified, output_shp)
+        arcpy.management.Delete(tmp_simplified)
 
         with arcpy.da.UpdateCursor(output_shp, ["SHAPE@"]) as cursor:
             for row in cursor:
