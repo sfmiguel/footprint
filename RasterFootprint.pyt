@@ -5,6 +5,7 @@
 #   1. Raster Footprint (Single Image)
 
 import os
+import math
 import arcpy
 
 
@@ -13,6 +14,117 @@ class Toolbox:
         self.label = "Raster Footprint Tools"
         self.alias = "RasterFootprint"
         self.tools = [RasterFootprintSingle]
+
+
+# ---------------------------------------------------------------------------
+# Geometry helper: close boundary indentations with straight chord lines
+# ---------------------------------------------------------------------------
+
+def _signed_area(pts):
+    """Shoelace formula. Positive = CCW winding."""
+    n = len(pts)
+    return sum(
+        pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+        for i in range(n)
+    ) / 2.0
+
+
+def _is_reflex(pts, i, ccw):
+    """
+    True if vertex i is a reflex vertex (interior angle > 180 degrees).
+    For a CCW polygon a right-hand turn (negative cross product) is reflex.
+    """
+    n    = len(pts)
+    prev = pts[(i - 1) % n]
+    curr = pts[i]
+    nxt  = pts[(i + 1) % n]
+    cross = (curr[0] - prev[0]) * (nxt[1] - curr[1]) \
+          - (curr[1] - prev[1]) * (nxt[0] - curr[0])
+    return cross < 0 if ccw else cross > 0
+
+
+def close_boundary_gaps(polygon_geom, max_gap_width):
+    """
+    Returns a new arcpy.Polygon where concave edge indentations whose chord
+    (straight-line distance between the two boundary points flanking the
+    indentation) is <= max_gap_width are replaced by that straight chord.
+
+    Interior holes must already have been eliminated before calling this.
+    Works on the outer ring (part 0) of the polygon.
+
+    Algorithm
+    ---------
+    1. Extract outer ring vertices and remove the closing duplicate.
+    2. Rotate the list so index 0 is a non-reflex vertex – this prevents
+       chains from wrapping across the array boundary.
+    3. Find maximal consecutive chains of reflex vertices.
+    4. For each chain whose chord (distance from flanking vertex A to flanking
+       vertex B) is <= max_gap_width, mark the chain vertices for removal.
+       Removing them leaves an implicit straight edge A -> B.
+    5. Rebuild the polygon from the remaining vertices.
+    """
+    sr   = polygon_geom.spatialReference
+    part = polygon_geom.getPart(0)
+
+    pts = [(part.getObject(i).X, part.getObject(i).Y)
+           for i in range(part.count)]
+
+    # Remove duplicate closing vertex if present
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+
+    n = len(pts)
+    if n < 3:
+        return polygon_geom
+
+    ccw    = _signed_area(pts) > 0
+    reflex = [_is_reflex(pts, i, ccw) for i in range(n)]
+
+    # Rotate so that index 0 is a non-reflex vertex.
+    # Guarantees no chain wraps around the array boundary.
+    first_convex = next((i for i in range(n) if not reflex[i]), None)
+    if first_convex is None:
+        return polygon_geom   # degenerate – all reflex
+    if first_convex != 0:
+        pts    = pts[first_convex:]    + pts[:first_convex]
+        reflex = reflex[first_convex:] + reflex[:first_convex]
+
+    # Find maximal chains of consecutive reflex vertices and decide which to close
+    skip = set()
+    i = 0
+    while i < n:
+        if not reflex[i]:
+            i += 1
+            continue
+
+        chain_start = i
+        chain_end   = i
+        while chain_end + 1 < n and reflex[chain_end + 1]:
+            chain_end += 1
+
+        a_idx = chain_start - 1          # flanking vertex before chain (always convex after rotation)
+        b_idx = (chain_end  + 1) % n     # flanking vertex after chain
+
+        ax, ay = pts[a_idx]
+        bx, by = pts[b_idx]
+        chord  = math.hypot(bx - ax, by - ay)
+
+        if chord <= max_gap_width:
+            for k in range(chain_start, chain_end + 1):
+                skip.add(k)
+
+        i = chain_end + 1
+
+    # Rebuild vertex list
+    new_pts = [arcpy.Point(x, y)
+               for idx, (x, y) in enumerate(pts)
+               if idx not in skip]
+
+    if len(new_pts) < 3:
+        return polygon_geom
+
+    new_pts.append(new_pts[0])   # close the ring
+    return arcpy.Polygon(arcpy.Array(new_pts), sr)
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +138,9 @@ class RasterFootprintSingle:
         self.description = (
             "Creates a polygon footprint for a single raster image using the "
             "ArcGIS 3D Analyst 'Raster Domain' tool. NoData pixels are excluded "
-            "from the footprint. If the image has no NoData value defined, the "
-            "user must supply one."
+            "from the footprint. Interior NoData holes and edge indentations can "
+            "optionally be closed by connecting their boundary endpoints with "
+            "straight lines."
         )
         self.canRunInBackground = False
 
@@ -62,14 +175,38 @@ class RasterFootprintSingle:
         )
         p2.value = None
 
-        return [p0, p1, p2]
+        # Parameter 3 – Close gaps toggle
+        p3 = arcpy.Parameter(
+            displayName   = "Close Interior Holes and Edge Gaps",
+            name          = "close_gaps",
+            datatype      = "GPBoolean",
+            parameterType = "Optional",
+            direction     = "Input"
+        )
+        p3.value = False
+
+        # Parameter 4 – Maximum gap width (active only when close_gaps = True)
+        p4 = arcpy.Parameter(
+            displayName   = "Maximum Gap Width to Close (map units)",
+            name          = "max_gap_width",
+            datatype      = "GPDouble",
+            parameterType = "Optional",
+            direction     = "Input"
+        )
+        p4.value   = None
+        p4.enabled = False
+
+        return [p0, p1, p2, p3, p4]
+
+    # ── Dynamic UI ─────────────────────────────────────────────────────────────
+
+    def updateParameters(self, parameters):
+        parameters[4].enabled = bool(parameters[3].value)
 
     def isLicensed(self):
-        """Allow the tool to run only if 3D Analyst is available."""
         return arcpy.CheckExtension("3D") == "Available"
 
     def updateMessages(self, parameters):
-        """Warn if raster has no NoData and user has not supplied one."""
         if parameters[0].value and not parameters[0].hasError():
             raster_path = str(parameters[0].value)
             if arcpy.Exists(raster_path):
@@ -80,11 +217,19 @@ class RasterFootprintSingle:
                         "The footprint will cover the full raster extent "
                         "unless you provide a NoData value here."
                     )
+        if parameters[3].value and not parameters[4].value:
+            parameters[4].setWarningMessage(
+                "Please specify the maximum gap width to close."
+            )
+
+    # ── Execute ────────────────────────────────────────────────────────────────
 
     def execute(self, parameters, messages):
-        image_path   = parameters[0].valueAsText
-        output_shp   = parameters[1].valueAsText
-        user_nodata  = parameters[2].value  # float or None
+        image_path    = parameters[0].valueAsText
+        output_shp    = parameters[1].valueAsText
+        user_nodata   = parameters[2].value
+        close_gaps    = bool(parameters[3].value)
+        max_gap_width = parameters[4].value
 
         arcpy.env.overwriteOutput = True
 
@@ -124,22 +269,68 @@ class RasterFootprintSingle:
         if out_dir and not os.path.isdir(out_dir):
             os.makedirs(out_dir)
 
-        # ── Run Raster Domain (3D Analyst) ─────────────────────────────────
+        # ── Step 1: Raster Domain ──────────────────────────────────────────
         arcpy.CheckOutExtension("3D")
         arcpy.AddMessage("[INFO] Running Raster Domain...")
 
+        tmp_domain = r"in_memory\tmp_domain" if close_gaps else output_shp
+
         arcpy.ddd.RasterDomain(
             in_raster         = raster_to_process,
-            out_feature_class = output_shp,
+            out_feature_class = tmp_domain,
             out_geometry_type = "POLYGON"
         )
-        arcpy.AddMessage(f"[INFO] Footprint created: {output_shp}")
 
-        # ── Clean up ───────────────────────────────────────────────────────
         if temp_raster and arcpy.Exists(temp_raster):
             arcpy.management.Delete(temp_raster)
 
         arcpy.CheckInExtension("3D")
+
+        if not close_gaps:
+            arcpy.AddMessage(f"[INFO] Footprint created: {output_shp}")
+            arcpy.AddMessage("[DONE] Process complete.")
+            return
+
+        # ── Step 2: Eliminate interior holes ──────────────────────────────
+        # Uses EliminatePolygonPart with CONTAINED_ONLY to remove only holes
+        # that are fully inside the polygon (not connected to the edge).
+        arcpy.AddMessage("[INFO] Eliminating interior holes...")
+        tmp_no_holes = r"in_memory\tmp_no_holes"
+
+        arcpy.management.EliminatePolygonPart(
+            in_features       = tmp_domain,
+            out_feature_class = tmp_no_holes,
+            condition         = "PERCENT",
+            part_area         = 0,
+            part_area_percent = 99,
+            part_option       = "CONTAINED_ONLY"
+        )
+        arcpy.management.Delete(tmp_domain)
+
+        # ── Step 3: Close edge indentations with straight chord lines ──────
+        # For each chain of consecutive reflex (inward-pointing) vertices on
+        # the outer ring, if the straight-line distance between the two flanking
+        # convex vertices is <= max_gap_width, the chain is removed and those
+        # two vertices are connected directly with a straight line.
+        # Gaps connected to the outside are handled this way.
+        # No rounding – the closing line is always perfectly straight.
+        arcpy.AddMessage(
+            f"[INFO] Closing edge gaps narrower than {max_gap_width} map units "
+            "by connecting boundary endpoints with straight lines..."
+        )
+
+        arcpy.management.CopyFeatures(tmp_no_holes, output_shp)
+        arcpy.management.Delete(tmp_no_holes)
+
+        with arcpy.da.UpdateCursor(output_shp, ["SHAPE@"]) as cursor:
+            for row in cursor:
+                geom = row[0]
+                if geom is None:
+                    continue
+                new_geom = close_boundary_gaps(geom, float(max_gap_width))
+                cursor.updateRow([new_geom])
+
+        arcpy.AddMessage(f"[INFO] Footprint created: {output_shp}")
         arcpy.AddMessage("[DONE] Process complete.")
 
     # ── Internal helper ───────────────────────────────────────────────────────
