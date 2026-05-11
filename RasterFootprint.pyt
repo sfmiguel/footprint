@@ -30,7 +30,7 @@ def _dist_point_to_segment(px, py, ax, ay, bx, by):
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
-def close_boundary_gaps(polygon_geom, max_gap_width, cell_size):
+def close_boundary_gaps(polygon_geom, min_gap_width, cell_size):
     """
     Close concave edge gaps using the convex hull as the reference boundary.
 
@@ -49,7 +49,7 @@ def close_boundary_gaps(polygon_geom, max_gap_width, cell_size):
        chord is the distance between the last on-edge vertex before the bay
        and the first on-edge vertex after it -- exactly the initial and final
        vertex the user described.
-    4. Bays whose chord <= max_gap_width are closed with a straight line
+    4. Bays whose chord >= min_gap_width are closed with a straight line
        (the bay vertices are removed; the two flanking edge vertices connect
        directly).
     """
@@ -126,13 +126,13 @@ def close_boundary_gaps(polygon_geom, max_gap_width, cell_size):
         chord = math.hypot(b[0] - a[0], b[1] - a[1])
         bays_found += 1
 
-        status = "CLOSE" if chord <= max_gap_width else "SKIP"
+        status = "CLOSE" if chord >= min_gap_width else "SKIP"
         arcpy.AddMessage(
             f"[DEBUG] Bay [{bay_start}:{bay_end}] "
             f"({bay_end - bay_start + 1} vertices), chord={chord:.2f} ({status})"
         )
 
-        if chord <= max_gap_width:
+        if chord >= min_gap_width:
             for k in range(bay_start, bay_end + 1):
                 skip.add(k)
             bays_closed += 1
@@ -206,8 +206,8 @@ class RasterFootprintSingle:
         p3.value = False
 
         p4 = arcpy.Parameter(
-            displayName   = "Maximum Gap Width to Close (map units)",
-            name          = "max_gap_width",
+            displayName   = "Minimum Gap Width to Close (map units)",
+            name          = "min_gap_width",
             datatype      = "GPDouble",
             parameterType = "Optional",
             direction     = "Input"
@@ -238,7 +238,7 @@ class RasterFootprintSingle:
                     )
         if parameters[3].value and not parameters[4].value:
             parameters[4].setWarningMessage(
-                "Please specify the maximum gap width to close."
+                "Please specify the minimum gap width to close."
             )
 
     # -- Execute --------------------------------------------------------------
@@ -248,24 +248,24 @@ class RasterFootprintSingle:
         output_shp    = parameters[1].valueAsText
         user_nodata   = parameters[2].value
         close_gaps    = bool(parameters[3].value)
-        max_gap_width = parameters[4].value
+        min_gap_width = parameters[4].value
 
         arcpy.AddMessage("=== Parameters received ===")
         arcpy.AddMessage(f"  Image path    : {image_path}")
         arcpy.AddMessage(f"  Output shp    : {output_shp}")
         arcpy.AddMessage(f"  User NoData   : {user_nodata}")
         arcpy.AddMessage(f"  Close gaps    : {close_gaps}")
-        arcpy.AddMessage(f"  Max gap width : {max_gap_width}")
+        arcpy.AddMessage(f"  Min gap width : {min_gap_width}")
         arcpy.AddMessage("===========================")
 
-        if close_gaps and max_gap_width is None:
+        if close_gaps and min_gap_width is None:
             arcpy.AddError(
-                "[ERROR] 'Maximum Gap Width' is required when 'Close Gaps' is enabled."
+                "[ERROR] 'Minimum Gap Width' is required when 'Close Gaps' is enabled."
             )
             return
 
-        if max_gap_width is not None:
-            max_gap_width = float(max_gap_width)
+        if min_gap_width is not None:
+            min_gap_width = float(min_gap_width)
 
         arcpy.env.overwriteOutput = True
 
@@ -349,7 +349,7 @@ class RasterFootprintSingle:
         # from and returns to the straight image edge) are connected directly
         # if their chord distance is <= max_gap_width.
         arcpy.AddMessage(
-            f"[INFO] Closing edge gaps narrower than {max_gap_width} map units "
+            f"[INFO] Closing edge gaps wider than {min_gap_width} map units "
             "by connecting gap endpoints on the straight image sides..."
         )
 
@@ -383,7 +383,7 @@ class RasterFootprintSingle:
                     f"across {geom.partCount} part(s)..."
                 )
                 try:
-                    new_geom = close_boundary_gaps(geom, max_gap_width, cell_size)
+                    new_geom = close_boundary_gaps(geom, min_gap_width, cell_size)
                     cursor.updateRow([new_geom])
                 except Exception as e:
                     arcpy.AddWarning(f"[WARN] Gap closing failed for a polygon: {e}")
