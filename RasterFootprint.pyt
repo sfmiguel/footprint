@@ -54,43 +54,66 @@ def close_boundary_gaps(polygon_geom, max_gap_width):
 
     Algorithm
     ---------
-    1. Extract outer ring vertices and remove the closing duplicate.
-    2. Rotate the list so index 0 is a non-reflex vertex – this prevents
-       chains from wrapping across the array boundary.
-    3. Find maximal consecutive chains of reflex vertices.
-    4. For each chain whose chord (distance from flanking vertex A to flanking
-       vertex B) is <= max_gap_width, mark the chain vertices for removal.
+    1. Extract outer ring vertices (stop at first None separator – ArcGIS uses
+       None to separate rings within a part; only the outer ring is needed).
+    2. Remove the duplicate closing vertex if present.
+    3. Rotate the list so index 0 is a non-reflex vertex – prevents chains
+       from wrapping across the array boundary.
+    4. Find maximal consecutive chains of reflex vertices.
+    5. For each chain whose chord <= max_gap_width, mark vertices for removal.
        Removing them leaves an implicit straight edge A -> B.
-    5. Rebuild the polygon from the remaining vertices.
+    6. Rebuild the polygon from the remaining vertices.
     """
     sr   = polygon_geom.spatialReference
     part = polygon_geom.getPart(0)
 
-    pts = [(part.getObject(i).X, part.getObject(i).Y)
-           for i in range(part.count)]
+    # Extract only the outer ring – stop at first None (ring separator)
+    pts = []
+    for i in range(part.count):
+        pnt = part.getObject(i)
+        if pnt is None:
+            break                          # reached inner-ring separator
+        pts.append((pnt.X, pnt.Y))
 
     # Remove duplicate closing vertex if present
     if len(pts) > 1 and pts[0] == pts[-1]:
         pts = pts[:-1]
 
     n = len(pts)
+    arcpy.AddMessage(f"[DEBUG] Outer ring has {n} vertices.")
+
     if n < 3:
+        arcpy.AddMessage("[DEBUG] Too few vertices – returning original.")
         return polygon_geom
 
-    ccw    = _signed_area(pts) > 0
+    area  = _signed_area(pts)
+    # ArcGIS exterior rings are typically CW (negative area in math convention).
+    # Treat both cases correctly.
+    ccw    = area > 0
+    arcpy.AddMessage(f"[DEBUG] Ring winding: {'CCW' if ccw else 'CW'}, signed area={area:.2f}")
+
     reflex = [_is_reflex(pts, i, ccw) for i in range(n)]
+    n_reflex = sum(reflex)
+    arcpy.AddMessage(f"[DEBUG] Reflex vertices found: {n_reflex}")
+
+    if n_reflex == 0:
+        arcpy.AddMessage("[DEBUG] No reflex vertices – no gaps to close.")
+        return polygon_geom
 
     # Rotate so that index 0 is a non-reflex vertex.
     # Guarantees no chain wraps around the array boundary.
     first_convex = next((i for i in range(n) if not reflex[i]), None)
     if first_convex is None:
-        return polygon_geom   # degenerate – all reflex
+        arcpy.AddMessage("[DEBUG] All vertices reflex – degenerate polygon.")
+        return polygon_geom
     if first_convex != 0:
         pts    = pts[first_convex:]    + pts[:first_convex]
         reflex = reflex[first_convex:] + reflex[:first_convex]
 
     # Find maximal chains of consecutive reflex vertices and decide which to close
-    skip = set()
+    skip        = set()
+    chains_found   = 0
+    chains_closed  = 0
     i = 0
     while i < n:
         if not reflex[i]:
@@ -102,18 +125,30 @@ def close_boundary_gaps(polygon_geom, max_gap_width):
         while chain_end + 1 < n and reflex[chain_end + 1]:
             chain_end += 1
 
-        a_idx = chain_start - 1          # flanking vertex before chain (always convex after rotation)
-        b_idx = (chain_end  + 1) % n     # flanking vertex after chain
+        a_idx = chain_start - 1
+        b_idx = (chain_end  + 1) % n
 
         ax, ay = pts[a_idx]
         bx, by = pts[b_idx]
         chord  = math.hypot(bx - ax, by - ay)
+        chains_found += 1
+        arcpy.AddMessage(
+            f"[DEBUG] Chain [{chain_start}:{chain_end}] "
+            f"({chain_end - chain_start + 1} vertices), chord={chord:.2f} "
+            f"({'CLOSE' if chord <= max_gap_width else 'SKIP – too wide'})"
+        )
 
         if chord <= max_gap_width:
             for k in range(chain_start, chain_end + 1):
                 skip.add(k)
+            chains_closed += 1
 
         i = chain_end + 1
+
+    arcpy.AddMessage(
+        f"[DEBUG] Chains found: {chains_found}, closed: {chains_closed}, "
+        f"vertices removed: {len(skip)}"
+    )
 
     # Rebuild vertex list
     new_pts = [arcpy.Point(x, y)
@@ -121,6 +156,7 @@ def close_boundary_gaps(polygon_geom, max_gap_width):
                if idx not in skip]
 
     if len(new_pts) < 3:
+        arcpy.AddMessage("[DEBUG] Too few vertices after closing – returning original.")
         return polygon_geom
 
     new_pts.append(new_pts[0])   # close the ring
