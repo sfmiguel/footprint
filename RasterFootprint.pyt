@@ -276,6 +276,13 @@ class RasterFootprintSingle:
         arcpy.AddMessage(f"  Max gap width : {max_gap_width}")
         arcpy.AddMessage("===========================")
 
+        if close_gaps and max_gap_width is None:
+            arcpy.AddError("[ERROR] 'Maximum Gap Width' is required when 'Close Gaps' is enabled.")
+            return
+
+        if max_gap_width is not None:
+            max_gap_width = float(max_gap_width)
+
         arcpy.env.overwriteOutput = True
 
         # ── Check / set NoData ─────────────────────────────────────────────
@@ -374,7 +381,7 @@ class RasterFootprintSingle:
                     continue
                 arcpy.AddMessage(f"[INFO] Processing polygon with {geom.pointCount} points across {geom.partCount} part(s)...")
                 try:
-                    new_geom = close_boundary_gaps(geom, float(max_gap_width))
+                    new_geom = close_boundary_gaps(geom, max_gap_width)
                     cursor.updateRow([new_geom])
                 except Exception as e:
                     arcpy.AddWarning(f"[WARN] Gap closing failed for a polygon: {e}")
