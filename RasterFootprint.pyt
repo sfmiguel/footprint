@@ -6,7 +6,6 @@
 #   2. Raster Footprint (Batch - Image Folder)
 
 import os
-import math
 import arcpy
 
 # Supported raster extensions (batch tool image discovery)
@@ -22,138 +21,100 @@ class Toolbox:
 
 
 # ---------------------------------------------------------------------------
-# Geometry helper
+# Gap closing
 # ---------------------------------------------------------------------------
-
-def _dist_point_to_segment(px, py, ax, ay, bx, by):
-    """Shortest distance from point (px,py) to segment (ax,ay)-(bx,by)."""
-    dx, dy = bx - ax, by - ay
-    seg_len_sq = dx * dx + dy * dy
-    if seg_len_sq == 0:
-        return math.hypot(px - ax, py - ay)
-    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len_sq))
-    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
 def close_boundary_gaps(polygon_geom, min_gap_width, cell_size):
     """
-    Close concave edge gaps using the convex hull as the reference boundary.
-
-    Because satellite image footprints always have straight sides, the convex
-    hull of the polygon is the correct outer boundary.  Any section of the
-    original boundary that deviates inward from a hull edge is a NoData bay.
+    Close NoData bays by comparing the raster domain polygon to its convex hull.
 
     Algorithm
     ---------
-    1. Compute the convex hull -> the straight-sided ideal footprint.
-    2. For every original polygon vertex compute its distance to the nearest
-       hull edge.  Vertices within `cell_size` of a hull edge are classified as
-       "on the straight image edge" (staircase steps are <= cell_size/2 away).
-       Vertices farther inside are classified as "in a bay".
-    3. Find consecutive groups of in-bay vertices.  For each bay the opening
-       chord is the distance between the last on-edge vertex before the bay
-       and the first on-edge vertex after it -- exactly the initial and final
-       vertex the user described.
-    4. Bays whose chord >= min_gap_width are closed with a straight line
-       (the bay vertices are removed; the two flanking edge vertices connect
-       directly).
+    1. Compute hull = convexHull(domain).
+    2. Compute all_gaps = hull.difference(domain).
+       Each gap polygon is an area that is inside the hull but missing from the
+       domain — either a NoData bay OR a natural boundary concavity.
+    3. For each gap polygon measure two lengths:
+         opening  = length of gap perimeter shared with the hull boundary
+                    (this is the straight-line chord at the mouth of the bay)
+         enclosed = length of gap perimeter shared with the domain boundary
+                    (these are the walls of the bay, surrounded by image data)
+    4. A gap is INSIDE the image data when:
+         enclosed >> opening  →  opening_fraction (opening/perimeter) < 0.5
+       A gap is OUTSIDE (natural image boundary) when:
+         opening >> enclosed  →  opening_fraction >= 0.5
+    5. Close only inside bays whose opening >= min_gap_width.
+       Closing = union(domain, gap): the bay walls (staircase, shared with domain)
+       cancel out; the hull edge (straight line) becomes the new boundary.
     """
     sr = polygon_geom.spatialReference
 
-    # ---- convex hull (straight-sided image boundary) -----------------------
     hull      = polygon_geom.convexHull()
-    hp        = hull.getPart(0)
-    hull_pts  = [(hp.getObject(i).X, hp.getObject(i).Y)
-                 for i in range(hp.count) if hp.getObject(i) is not None]
-    if hull_pts and hull_pts[0] == hull_pts[-1]:
-        hull_pts = hull_pts[:-1]
-    hn = len(hull_pts)
+    all_gaps  = hull.difference(polygon_geom)
 
-    arcpy.AddMessage(
-        f"[DEBUG] Convex hull: {hn} vertices.  "
-        f"On-hull tolerance = {cell_size:.4f} (1 cell)."
-    )
-
-    # ---- outer ring of original polygon ------------------------------------
-    part = polygon_geom.getPart(0)
-    pts  = [(part.getObject(i).X, part.getObject(i).Y)
-            for i in range(part.count) if part.getObject(i) is not None]
-    if pts and pts[0] == pts[-1]:
-        pts = pts[:-1]
-    n = len(pts)
-
-    if n < 3:
+    if all_gaps is None or all_gaps.area == 0:
+        arcpy.AddMessage("[DEBUG] No gaps between domain and convex hull.")
         return polygon_geom
 
-    # ---- classify every vertex: on-hull or in-bay --------------------------
-    def dist_to_hull(px, py):
-        return min(
-            _dist_point_to_segment(
-                px, py,
-                hull_pts[j][0], hull_pts[j][1],
-                hull_pts[(j + 1) % hn][0], hull_pts[(j + 1) % hn][1]
-            )
-            for j in range(hn)
-        )
+    hull_boundary   = hull.boundary()
+    gap_count       = all_gaps.partCount
+    arcpy.AddMessage(f"[DEBUG] {gap_count} gap region(s) between hull and domain.")
 
-    on_hull = [dist_to_hull(x, y) <= cell_size for (x, y) in pts]
-    arcpy.AddMessage(
-        f"[DEBUG] Polygon: {n} vertices — "
-        f"on-hull: {sum(on_hull)}, in-bay: {n - sum(on_hull)}"
-    )
+    new_geom = polygon_geom
+    closed = skipped_narrow = skipped_outside = 0
 
-    # rotate so index 0 is on-hull (avoids bays wrapping across the array end)
-    first_on = next((i for i in range(n) if on_hull[i]), None)
-    if first_on is None:
-        arcpy.AddWarning("[WARN] No vertices on hull boundary — returning original.")
-        return polygon_geom
-    if first_on != 0:
-        pts     = pts[first_on:]     + pts[:first_on]
-        on_hull = on_hull[first_on:] + on_hull[:first_on]
+    for i in range(gap_count):
+        arr = all_gaps.getPart(i)
+        gap = arcpy.Polygon(arr, sr)
 
-    # ---- detect bays and close those within max_gap_width ------------------
-    skip = set()
-    bays_found = bays_closed = 0
-    i = 0
-    while i < n:
-        if on_hull[i]:
-            i += 1
+        gap_perimeter = gap.length
+        if gap_perimeter == 0:
             continue
 
-        bay_start = i
-        bay_end   = i
-        while bay_end + 1 < n and not on_hull[bay_end + 1]:
-            bay_end += 1
+        # Length of gap perimeter along the hull = the opening / chord
+        try:
+            shared_hull  = gap.boundary().intersect(hull_boundary, 2)
+            opening      = shared_hull.length if shared_hull else 0.0
+        except Exception:
+            opening = 0.0
 
-        # initial and final vertex flanking the bay
-        a = pts[bay_start - 1]
-        b = pts[(bay_end + 1) % n]
-        chord = math.hypot(b[0] - a[0], b[1] - a[1])
-        bays_found += 1
+        opening_frac = opening / gap_perimeter if gap_perimeter > 0 else 1.0
 
-        status = "CLOSE" if chord >= min_gap_width else "SKIP"
         arcpy.AddMessage(
-            f"[DEBUG] Bay [{bay_start}:{bay_end}] "
-            f"({bay_end - bay_start + 1} vertices), chord={chord:.2f} ({status})"
+            f"[DEBUG] Gap {i + 1}/{gap_count}: area={gap.area:.1f}, "
+            f"opening={opening:.1f}, open_frac={opening_frac:.2f}"
         )
 
-        if chord >= min_gap_width:
-            for k in range(bay_start, bay_end + 1):
-                skip.add(k)
-            bays_closed += 1
+        # Too narrow to be a real bay (staircase noise)
+        if opening < min_gap_width:
+            arcpy.AddMessage(
+                f"  → SKIP (opening {opening:.1f} < min_gap_width {min_gap_width})"
+            )
+            skipped_narrow += 1
+            continue
 
-        i = bay_end + 1
+        # More than half the perimeter is exposed to hull → natural boundary
+        if opening_frac >= 0.5:
+            arcpy.AddMessage(
+                f"  → SKIP (outside image boundary, "
+                f"{opening_frac * 100:.0f}% of perimeter along hull)"
+            )
+            skipped_outside += 1
+            continue
+
+        # Inside bay: fill with union; hull edge becomes the straight closure
+        arcpy.AddMessage(
+            f"  → CLOSE (inside image data, opening {opening:.1f} >= {min_gap_width})"
+        )
+        new_geom = new_geom.union(gap)
+        closed += 1
 
     arcpy.AddMessage(
-        f"[DEBUG] Bays found: {bays_found}, closed: {bays_closed}, "
-        f"vertices removed: {len(skip)}"
+        f"[DEBUG] Closed: {closed}, skipped narrow: {skipped_narrow}, "
+        f"skipped outside: {skipped_outside}"
     )
-
-    new_pts = [arcpy.Point(x, y) for idx, (x, y) in enumerate(pts) if idx not in skip]
-    if len(new_pts) < 3:
-        return polygon_geom
-    new_pts.append(new_pts[0])
-    return arcpy.Polygon(arcpy.Array(new_pts), sr)
+    return new_geom
 
 
 # ---------------------------------------------------------------------------
