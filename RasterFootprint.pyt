@@ -17,134 +17,137 @@ class Toolbox:
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers for vertex-chain gap closing
+# Geometry helper
 # ---------------------------------------------------------------------------
 
-def _signed_area(pts):
-    """Shoelace formula. Positive = CCW winding."""
-    n = len(pts)
-    return sum(
-        pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
-        for i in range(n)
-    ) / 2.0
+def _dist_point_to_segment(px, py, ax, ay, bx, by):
+    """Shortest distance from point (px,py) to segment (ax,ay)-(bx,by)."""
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len_sq))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
-def _is_reflex(pts, i, ccw):
+def close_boundary_gaps(polygon_geom, max_gap_width, cell_size):
     """
-    True if vertex i is a reflex vertex (interior angle > 180 degrees).
-    For a CCW polygon a right-hand turn (negative cross product) is reflex.
-    """
-    n    = len(pts)
-    prev = pts[(i - 1) % n]
-    curr = pts[i]
-    nxt  = pts[(i + 1) % n]
-    cross = (curr[0] - prev[0]) * (nxt[1] - curr[1]) \
-          - (curr[1] - prev[1]) * (nxt[0] - curr[0])
-    return cross < 0 if ccw else cross > 0
+    Close concave edge gaps using the convex hull as the reference boundary.
 
-
-def close_boundary_gaps(polygon_geom, max_gap_width):
-    """
-    Returns a new arcpy.Polygon where concave edge indentations whose chord
-    (straight-line distance between the two boundary points flanking the
-    indentation) is <= max_gap_width are replaced by that straight chord.
-
-    The polygon must already have been simplified to remove pixel-grid
-    staircase artifacts before calling this (see Step 2b in execute).
+    Because satellite image footprints always have straight sides, the convex
+    hull of the polygon is the correct outer boundary.  Any section of the
+    original boundary that deviates inward from a hull edge is a NoData bay.
 
     Algorithm
     ---------
-    1. Extract outer ring vertices.
-    2. Remove the duplicate closing vertex if present.
-    3. Rotate the list so index 0 is a non-reflex vertex.
-    4. Find maximal consecutive chains of reflex vertices.
-    5. For each chain whose chord <= max_gap_width, remove those vertices
-       (the two flanking vertices are then connected directly).
-    6. Rebuild the polygon from the remaining vertices.
+    1. Compute the convex hull -> the straight-sided ideal footprint.
+    2. For every original polygon vertex compute its distance to the nearest
+       hull edge.  Vertices within `cell_size` of a hull edge are classified as
+       "on the straight image edge" (staircase steps are <= cell_size/2 away).
+       Vertices farther inside are classified as "in a bay".
+    3. Find consecutive groups of in-bay vertices.  For each bay the opening
+       chord is the distance between the last on-edge vertex before the bay
+       and the first on-edge vertex after it -- exactly the initial and final
+       vertex the user described.
+    4. Bays whose chord <= max_gap_width are closed with a straight line
+       (the bay vertices are removed; the two flanking edge vertices connect
+       directly).
     """
-    sr   = polygon_geom.spatialReference
+    sr = polygon_geom.spatialReference
+
+    # ---- convex hull (straight-sided image boundary) -----------------------
+    hull      = polygon_geom.convexHull()
+    hp        = hull.getPart(0)
+    hull_pts  = [(hp.getObject(i).X, hp.getObject(i).Y)
+                 for i in range(hp.count) if hp.getObject(i) is not None]
+    if hull_pts and hull_pts[0] == hull_pts[-1]:
+        hull_pts = hull_pts[:-1]
+    hn = len(hull_pts)
+
+    arcpy.AddMessage(
+        f"[DEBUG] Convex hull: {hn} vertices.  "
+        f"On-hull tolerance = {cell_size:.4f} (1 cell)."
+    )
+
+    # ---- outer ring of original polygon ------------------------------------
     part = polygon_geom.getPart(0)
-
-    # Extract only the outer ring - stop at first None (ring separator)
-    pts = []
-    for i in range(part.count):
-        pnt = part.getObject(i)
-        if pnt is None:
-            break
-        pts.append((pnt.X, pnt.Y))
-
-    # Remove duplicate closing vertex if present
-    if len(pts) > 1 and pts[0] == pts[-1]:
+    pts  = [(part.getObject(i).X, part.getObject(i).Y)
+            for i in range(part.count) if part.getObject(i) is not None]
+    if pts and pts[0] == pts[-1]:
         pts = pts[:-1]
-
     n = len(pts)
+
     if n < 3:
         return polygon_geom
 
-    area = _signed_area(pts)
-    ccw  = area > 0
+    # ---- classify every vertex: on-hull or in-bay --------------------------
+    def dist_to_hull(px, py):
+        return min(
+            _dist_point_to_segment(
+                px, py,
+                hull_pts[j][0], hull_pts[j][1],
+                hull_pts[(j + 1) % hn][0], hull_pts[(j + 1) % hn][1]
+            )
+            for j in range(hn)
+        )
 
-    reflex   = [_is_reflex(pts, i, ccw) for i in range(n)]
-    n_reflex = sum(reflex)
-    arcpy.AddMessage(f"[DEBUG] Vertices: {n}, reflex: {n_reflex}, winding: {'CCW' if ccw else 'CW'}")
+    on_hull = [dist_to_hull(x, y) <= cell_size for (x, y) in pts]
+    arcpy.AddMessage(
+        f"[DEBUG] Polygon: {n} vertices — "
+        f"on-hull: {sum(on_hull)}, in-bay: {n - sum(on_hull)}"
+    )
 
-    if n_reflex == 0:
+    # rotate so index 0 is on-hull (avoids bays wrapping across the array end)
+    first_on = next((i for i in range(n) if on_hull[i]), None)
+    if first_on is None:
+        arcpy.AddWarning("[WARN] No vertices on hull boundary — returning original.")
         return polygon_geom
+    if first_on != 0:
+        pts     = pts[first_on:]     + pts[:first_on]
+        on_hull = on_hull[first_on:] + on_hull[:first_on]
 
-    # Rotate so index 0 is non-reflex (avoids wrap-around chains)
-    first_convex = next((i for i in range(n) if not reflex[i]), None)
-    if first_convex is None:
-        return polygon_geom
-    if first_convex != 0:
-        pts    = pts[first_convex:]    + pts[:first_convex]
-        reflex = reflex[first_convex:] + reflex[:first_convex]
-
-    # Find consecutive chains of reflex vertices and close those within threshold
-    skip           = set()
-    chains_found   = 0
-    chains_closed  = 0
+    # ---- detect bays and close those within max_gap_width ------------------
+    skip = set()
+    bays_found = bays_closed = 0
     i = 0
     while i < n:
-        if not reflex[i]:
+        if on_hull[i]:
             i += 1
             continue
 
-        chain_start = i
-        chain_end   = i
-        while chain_end + 1 < n and reflex[chain_end + 1]:
-            chain_end += 1
+        bay_start = i
+        bay_end   = i
+        while bay_end + 1 < n and not on_hull[bay_end + 1]:
+            bay_end += 1
 
-        ax, ay = pts[chain_start - 1]
-        bx, by = pts[(chain_end + 1) % n]
-        chord  = math.hypot(bx - ax, by - ay)
-        chains_found += 1
+        # initial and final vertex flanking the bay
+        a = pts[bay_start - 1]
+        b = pts[(bay_end + 1) % n]
+        chord = math.hypot(b[0] - a[0], b[1] - a[1])
+        bays_found += 1
 
         status = "CLOSE" if chord <= max_gap_width else "SKIP"
         arcpy.AddMessage(
-            f"[DEBUG] Chain [{chain_start}:{chain_end}] "
-            f"({chain_end - chain_start + 1} vertices), chord={chord:.2f} ({status})"
+            f"[DEBUG] Bay [{bay_start}:{bay_end}] "
+            f"({bay_end - bay_start + 1} vertices), chord={chord:.2f} ({status})"
         )
 
         if chord <= max_gap_width:
-            for k in range(chain_start, chain_end + 1):
+            for k in range(bay_start, bay_end + 1):
                 skip.add(k)
-            chains_closed += 1
+            bays_closed += 1
 
-        i = chain_end + 1
+        i = bay_end + 1
 
     arcpy.AddMessage(
-        f"[DEBUG] Chains found: {chains_found}, closed: {chains_closed}, "
+        f"[DEBUG] Bays found: {bays_found}, closed: {bays_closed}, "
         f"vertices removed: {len(skip)}"
     )
 
-    new_pts = [arcpy.Point(x, y)
-               for idx, (x, y) in enumerate(pts)
-               if idx not in skip]
-
+    new_pts = [arcpy.Point(x, y) for idx, (x, y) in enumerate(pts) if idx not in skip]
     if len(new_pts) < 3:
         return polygon_geom
-
-    new_pts.append(new_pts[0])   # close the ring
+    new_pts.append(new_pts[0])
     return arcpy.Polygon(arcpy.Array(new_pts), sr)
 
 
@@ -324,7 +327,7 @@ class RasterFootprintSingle:
             arcpy.AddMessage("[DONE] Process complete.")
             return
 
-        # -- Step 2a: Eliminate interior holes --------------------------------
+        # -- Step 2: Eliminate interior holes ---------------------------------
         arcpy.AddMessage("[INFO] Eliminating interior holes...")
         tmp_no_holes = r"in_memory\tmp_no_holes"
 
@@ -338,14 +341,18 @@ class RasterFootprintSingle:
         )
         arcpy.management.Delete(tmp_domain)
 
-        # -- Step 2b: Simplify to remove pixel-grid staircase artifacts -------
-        # The raster footprint has a staircase boundary where convex and reflex
-        # vertices alternate every pixel. This prevents the chain algorithm from
-        # detecting real concave gaps (whose lips also have staircase rims).
-        # Generalizing with a tolerance equal to the pixel cell size collapses
-        # those single-pixel steps into clean diagonal lines. The actual concave
-        # bays (which span many pixels) survive and become proper consecutive
-        # reflex-vertex chains that the algorithm can detect and close.
+        # -- Step 3: Close edge gaps with convex-hull vertex approach ---------
+        # The convex hull defines the straight-sided ideal footprint boundary.
+        # Vertices within one cell size of a hull edge are "on the straight
+        # image side"; consecutive vertices further inside form a NoData bay.
+        # Each bay's initial and final vertices (the points where it diverges
+        # from and returns to the straight image edge) are connected directly
+        # if their chord distance is <= max_gap_width.
+        arcpy.AddMessage(
+            f"[INFO] Closing edge gaps narrower than {max_gap_width} map units "
+            "by connecting gap endpoints on the straight image sides..."
+        )
+
         try:
             cell_size = float(arcpy.Describe(image_path).children[0].meanCellWidth)
         except Exception:
@@ -354,34 +361,17 @@ class RasterFootprintSingle:
             except Exception:
                 cell_size = 0.0
 
-        tmp_simplified = r"in_memory\tmp_simplified"
-        if cell_size > 0:
-            arcpy.AddMessage(
-                f"[INFO] Simplifying polygon with tolerance = {cell_size:.4f} "
-                "(= 1 pixel) to remove staircase artifacts before gap detection..."
-            )
-            arcpy.management.CopyFeatures(tmp_no_holes, tmp_simplified)
-            # Generalize in-place: removes vertices within tolerance of the line
-            # between their neighbours. Does not require Cartography extension.
-            arcpy.edit.Generalize(tmp_simplified, f"{cell_size} Unknown")
-        else:
+        if cell_size <= 0:
             arcpy.AddWarning(
-                "[WARN] Could not determine pixel cell size; "
-                "skipping staircase simplification. "
-                "Gap detection may miss raster-edge bays."
+                "[WARN] Could not determine pixel cell size. "
+                "Using fallback tolerance of 30 map units."
             )
-            arcpy.management.CopyFeatures(tmp_no_holes, tmp_simplified)
+            cell_size = 30.0
 
+        arcpy.AddMessage(f"[INFO] Raster cell size: {cell_size:.4f}")
+
+        arcpy.management.CopyFeatures(tmp_no_holes, output_shp)
         arcpy.management.Delete(tmp_no_holes)
-
-        # -- Step 3: Close edge gaps with vertex-chain straight-line closing --
-        arcpy.AddMessage(
-            f"[INFO] Closing edge gaps narrower than {max_gap_width} map units "
-            "by connecting boundary endpoints with straight lines..."
-        )
-
-        arcpy.management.CopyFeatures(tmp_simplified, output_shp)
-        arcpy.management.Delete(tmp_simplified)
 
         with arcpy.da.UpdateCursor(output_shp, ["SHAPE@"]) as cursor:
             for row in cursor:
@@ -393,7 +383,7 @@ class RasterFootprintSingle:
                     f"across {geom.partCount} part(s)..."
                 )
                 try:
-                    new_geom = close_boundary_gaps(geom, max_gap_width)
+                    new_geom = close_boundary_gaps(geom, max_gap_width, cell_size)
                     cursor.updateRow([new_geom])
                 except Exception as e:
                     arcpy.AddWarning(f"[WARN] Gap closing failed for a polygon: {e}")
